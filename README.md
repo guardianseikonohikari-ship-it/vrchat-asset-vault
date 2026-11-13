@@ -48,17 +48,24 @@ Explicitly **not** in v1: syncing purchases with Booth/Gumroad
 (Blender, CATS and VRWorldToolkit already do that — v1 only *warns*),
 a full PBR 3D viewer, AI search, cloud, or a model store.
 
-## Install (Windows, from source for now)
+## Install (Windows)
+
+**Easiest — just double-click:** download `VRChat Asset Vault.exe`
+from the latest GitHub Release and double-click it. No Python, no
+commands, no account.
+
+**From the folder:** clone the repo, then double-click `run.bat`.
+It installs the app the first time (needs Python 3.11+ from
+python.org) and then opens the window. No commands needed.
+
+**From a terminal, if you prefer:**
 
 ```bat
 python -m venv .venv
 .venv\Scripts\activate
-pip install -e .
-python -m vrchat_asset_vault --help
+pip install -e .[gui]
+python -m vrchat_asset_vault gui
 ```
-
-A PyInstaller `.exe` for GitHub Releases is planned — no account,
-no subscription, no telemetry.
 
 ## Use
 
