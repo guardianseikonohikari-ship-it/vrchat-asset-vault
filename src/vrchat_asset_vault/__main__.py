@@ -28,7 +28,14 @@ def main(argv: list[str] | None = None) -> int:
     p_export.add_argument("--collection", required=True)
     p_export.add_argument("--out", required=True)
 
+    sub.add_parser("gui", help="Open the intuitive graphical interface")
+
     args = parser.parse_args(argv)
+
+    if args.cmd == "gui":
+        from .gui import run
+
+        return run()
 
     if args.cmd == "scan":
         assets = scan(Path(args.root))
