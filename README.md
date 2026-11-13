@@ -68,8 +68,15 @@ python -m vrchat_asset_vault budget vault.db --world "Biblioteca Prohibida"
 python -m vrchat_asset_vault export vault.db --collection "Biblioteca Prohibida" --out "D:\Exports\Biblioteca"
 ```
 
-The GUI (PySide6) is the next step after this CLI core; the scanner,
-budget checker and exporter are the same code the GUI will call.
+Or open the graphical interface (needs the `[gui]` extra):
+
+```bat
+python -m vrchat_asset_vault gui
+```
+
+The GUI (PySide6, `src/vrchat_asset_vault/gui.py`) calls the same
+scanner, budget checker and exporter as this CLI, so the two can
+never disagree about a triangle count.
 
 ## Tech
 
