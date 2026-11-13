@@ -25,7 +25,27 @@ try:
         QVBoxLayout,
         QWidget,
     )
-except ImportError:  # pragma: no cover - GUI is optional in the CLI install
+
+    _QT_AVAILABLE = True
+    _QT_ERROR: Exception | None = None
+except ImportError as exc:  # GUI is optional in the CLI install
+    # Do NOT leave the Qt names undefined: that used to crash the import
+    # with a confusing NameError instead of a clear message. A missing
+    # Qt (e.g. libEGL.so.1 on Linux) is an ImportError here, and the
+    # dummy base below turns it into a readable RuntimeError on use.
+    _QT_AVAILABLE = False
+    _QT_ERROR = exc
+
+    class _MissingQt:
+        def __init__(self, *args, **kwargs):
+            raise RuntimeError(
+                f"PySide6 is not available: {_QT_ERROR}. "
+                "Install it with: pip install vrchat-asset-vault[gui]"
+            )
+
+    Qt = QApplication = QFrame = QHBoxLayout = QLabel = QListWidget = QLineEdit = (
+        QMainWindow
+    ) = QPushButton = QSplitter = QStatusBar = QVBoxLayout = QWidget = _MissingQt
     PySide6 = None  # type: ignore
 
 from .budget import check_asset, AssetStats
@@ -116,8 +136,11 @@ class MainWindow(QMainWindow):
 
 
 def run() -> int:
-    if PySide6 is None:
-        raise SystemExit("PySide6 is not installed. Run: pip install vrchat-asset-vault[gui]")
+    if not _QT_AVAILABLE:
+        raise SystemExit(
+            f"PySide6 is not available: {_QT_ERROR}. "
+            "Run: pip install vrchat-asset-vault[gui]"
+        )
     app = QApplication([])
     window = MainWindow()
     window.show()
