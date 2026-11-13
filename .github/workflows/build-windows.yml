@@ -1,0 +1,33 @@
+name: Build Windows .exe
+
+# Double-click download for users who never want a terminal:
+# push a tag like v0.1.0 and GitHub builds VRChat Asset Vault.exe
+# on Windows, then attaches it to the Release.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install app and PyInstaller
+        run: pip install .[gui] pyinstaller
+      - name: Build .exe
+        run: pyinstaller vrchat-asset-vault.spec
+      - name: Upload .exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: VRChat-Asset-Vault-Windows
+          path: dist/VRChat Asset Vault.exe
+      - name: Attach to Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/VRChat Asset Vault.exe
