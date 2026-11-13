@@ -59,6 +59,43 @@ def upsert_asset(conn: sqlite3.Connection, asset) -> None:
     conn.commit()
 
 
+META_FIELDS = ("source", "author", "url", "license", "tags", "favorite", "collection")
+
+
+def update_asset_meta(conn: sqlite3.Connection, path: str, **fields) -> None:
+    """Save the user's own notes for an asset (tags, origin, favorite...)."""
+    sets = []
+    values: list = []
+    for key, value in fields.items():
+        if key not in META_FIELDS:
+            raise ValueError(f"unknown metadata field: {key}")
+        sets.append(f"{key}=?")
+        values.append(value)
+    if not sets:
+        return
+    values.append(path)
+    conn.execute(f"UPDATE assets SET {', '.join(sets)} WHERE path=?", values)
+    conn.commit()
+
+
+def load_meta(conn: sqlite3.Connection, path: str) -> dict:
+    """The saved metadata for one asset (empty strings when never edited)."""
+    row = conn.execute(
+        "SELECT source, author, url, license, tags, favorite, collection "
+        "FROM assets WHERE path=?",
+        (path,),
+    ).fetchone()
+    if row is None:
+        return {k: "" for k in META_FIELDS}
+    return dict(zip(META_FIELDS, row))
+
+
+def delete_asset(conn: sqlite3.Connection, path: str) -> None:
+    """Remove an asset from the index only — the file on disk is untouched."""
+    conn.execute("DELETE FROM assets WHERE path=?", (path,))
+    conn.commit()
+
+
 def find_duplicates(conn: sqlite3.Connection) -> list[tuple[str, int]]:
     """(sha256, count) for files stored twice under different paths."""
     return conn.execute(
