@@ -17,6 +17,11 @@ CREATE TABLE IF NOT EXISTS assets (
     size_bytes INTEGER NOT NULL,
     sha256 TEXT NOT NULL,
     triangles INTEGER,
+    materials INTEGER,
+    scale_factor REAL,
+    max_texture_px INTEGER,
+    texture_count INTEGER DEFAULT 0,
+    texture_bytes INTEGER DEFAULT 0,
     source TEXT DEFAULT '',
     author TEXT DEFAULT '',
     url TEXT DEFAULT '',
@@ -29,23 +34,47 @@ CREATE INDEX IF NOT EXISTS idx_assets_sha ON assets(sha256);
 CREATE INDEX IF NOT EXISTS idx_assets_collection ON assets(collection);
 """
 
+# Columns added after v0.1 — old vault.db files gain them on first open.
+_MIGRATIONS = {
+    "materials": "ALTER TABLE assets ADD COLUMN materials INTEGER",
+    "scale_factor": "ALTER TABLE assets ADD COLUMN scale_factor REAL",
+    "max_texture_px": "ALTER TABLE assets ADD COLUMN max_texture_px INTEGER",
+    "texture_count": "ALTER TABLE assets ADD COLUMN texture_count INTEGER DEFAULT 0",
+    "texture_bytes": "ALTER TABLE assets ADD COLUMN texture_bytes INTEGER DEFAULT 0",
+}
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(assets)")}
+    for column, sql in _MIGRATIONS.items():
+        if column not in existing:
+            conn.execute(sql)
+    conn.commit()
+
 
 def connect(db_path: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.executescript(SCHEMA)
+    _migrate(conn)
     return conn
 
 
 def upsert_asset(conn: sqlite3.Connection, asset) -> None:
     conn.execute(
         """
-        INSERT INTO assets (path, filename, format, size_bytes, sha256, triangles)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO assets (path, filename, format, size_bytes, sha256,
+            triangles, materials, scale_factor, max_texture_px, texture_count, texture_bytes)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(path) DO UPDATE SET
             size_bytes=excluded.size_bytes,
             sha256=excluded.sha256,
-            triangles=excluded.triangles
+            triangles=excluded.triangles,
+            materials=excluded.materials,
+            scale_factor=excluded.scale_factor,
+            max_texture_px=excluded.max_texture_px,
+            texture_count=excluded.texture_count,
+            texture_bytes=excluded.texture_bytes
         """,
         (
             str(asset.path),
@@ -54,6 +83,11 @@ def upsert_asset(conn: sqlite3.Connection, asset) -> None:
             asset.size_bytes,
             asset.sha256,
             asset.triangles,
+            getattr(asset, "materials", None),
+            getattr(asset, "scale_factor", None),
+            getattr(asset, "max_texture_px", None),
+            getattr(asset, "texture_count", 0),
+            getattr(asset, "texture_bytes", 0),
         ),
     )
     conn.commit()
@@ -96,6 +130,24 @@ def delete_asset(conn: sqlite3.Connection, path: str) -> None:
     conn.commit()
 
 
+def prune_missing(conn: sqlite3.Connection, existing_paths) -> int:
+    """Drop index rows whose file no longer exists on disk.
+
+    A scan only ever upserts, so without this a deleted or moved file
+    would haunt the library forever. Returns how many rows were removed.
+    """
+    existing = set(existing_paths)
+    rows = conn.execute("SELECT path FROM assets").fetchall()
+    removed = 0
+    for (path,) in rows:
+        if path not in existing:
+            conn.execute("DELETE FROM assets WHERE path=?", (path,))
+            removed += 1
+    if removed:
+        conn.commit()
+    return removed
+
+
 def find_duplicates(conn: sqlite3.Connection) -> list[tuple[str, int]]:
     """(sha256, count) for files stored twice under different paths."""
     return conn.execute(
@@ -106,7 +158,38 @@ def find_duplicates(conn: sqlite3.Connection) -> list[tuple[str, int]]:
 def list_assets(conn: sqlite3.Connection, collection: str | None = None):
     if collection:
         return conn.execute(
-            "SELECT path, triangles, size_bytes FROM assets WHERE collection = ?",
+            "SELECT path, triangles, size_bytes, texture_bytes FROM assets "
+            "WHERE collection = ?",
             (collection,),
         ).fetchall()
-    return conn.execute("SELECT path, triangles, size_bytes FROM assets").fetchall()
+    return conn.execute(
+        "SELECT path, triangles, size_bytes, texture_bytes FROM assets"
+    ).fetchall()
+
+
+def collection_texture_totals(
+    conn: sqlite3.Connection, collection: str | None = None, top_n: int = 5
+) -> dict:
+    """Texture-memory totals for a collection (or the whole library).
+
+    VRChat's 100 MB Quest limit is usually blown by textures, not by
+    the models themselves — this is the number that tells the creator
+    which assets to shrink first. "heaviest" lists the worst offenders
+    by texture bytes, biggest first.
+    """
+    rows = list_assets(conn, collection)
+    total_tex = sum(r[3] or 0 for r in rows)
+    total_size = sum(r[2] or 0 for r in rows)
+    total_tris = sum(r[1] or 0 for r in rows)
+    heaviest = sorted(rows, key=lambda r: r[3] or 0, reverse=True)[:top_n]
+    return {
+        "assets": len(rows),
+        "triangles": total_tris,
+        "texture_bytes": total_tex,
+        "model_bytes": total_size,
+        "heaviest": [
+            {"path": r[0], "texture_bytes": r[3] or 0}
+            for r in heaviest
+            if (r[3] or 0) > 0
+        ],
+    }

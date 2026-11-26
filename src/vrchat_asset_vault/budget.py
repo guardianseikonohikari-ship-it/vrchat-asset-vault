@@ -26,7 +26,62 @@ class AssetStats:
     triangles: int | None = None  # None = unknown (e.g. .blend, not parsed yet)
     materials: int | None = None
     max_texture_px: int | None = None
+    scale_factor: float | None = None
     size_bytes: int = 0
+
+
+def scale_warning(scale_factor: float | None) -> str | None:
+    """What a non-1.0 FBX UnitScaleFactor means when importing in Unity."""
+    if scale_factor is None or scale_factor == 1.0:
+        return None
+    if scale_factor == 0.01:
+        return (
+            "UnitScaleFactor is 0.01 (Blender's default export) — Unity may "
+            "import this model 100x smaller than expected; in Unity's FBX "
+            "import settings, check the Scale Factor (usually set it to 1)."
+        )
+    return (
+        f"UnitScaleFactor is {scale_factor} (not 1.0) — Unity may import "
+        "this model at the wrong size; check the Scale Factor in the FBX "
+        "import settings."
+    )
+
+
+def texture_totals_for(assets) -> dict:
+    """Texture-memory totals for a list of assets (a collection / world).
+
+    The 100 MB Quest limit is usually blown by textures, not by the
+    models themselves — "heaviest" names the assets to shrink first.
+    Works on in-memory FoundAsset objects (same shape as the DB helper
+    collection_texture_totals, so GUI and CLI can never disagree).
+    """
+    total_tex = sum(a.texture_bytes or 0 for a in assets)
+    total_tris = sum(a.triangles or 0 for a in assets)
+    heaviest = sorted(assets, key=lambda a: a.texture_bytes or 0, reverse=True)[:5]
+    return {
+        "assets": len(assets),
+        "triangles": total_tris,
+        "texture_bytes": total_tex,
+        "heaviest": [
+            {"name": a.path.name, "texture_bytes": a.texture_bytes or 0}
+            for a in heaviest
+            if (a.texture_bytes or 0) > 0
+        ],
+    }
+
+
+def fmt_bytes(n: int) -> str:
+    """Human size: MB with one decimal, else KB, else bytes."""
+    if n >= 1024 * 1024:
+        return f"{n / (1024 * 1024):.1f} MB"
+    if n >= 1024:
+        return f"{n / 1024:.0f} KB"
+    return f"{n} B"
+
+
+def texture_mb_light(texture_mb: float) -> str:
+    """Traffic light for texture memory vs the 100 MB Quest limit."""
+    return traffic_light(texture_mb, 80, 100)
 
 
 def traffic_light(value: int | None, warn_at: int, bad_at: int) -> str:
@@ -73,6 +128,9 @@ def warnings_for(stats: AssetStats) -> list[str]:
         warnings.append(
             f"{stats.materials} materials — each one adds a submesh / draw call."
         )
+    scale = scale_warning(stats.scale_factor)
+    if scale is not None:
+        warnings.append(scale)
     return warnings
 
 
