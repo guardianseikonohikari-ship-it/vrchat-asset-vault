@@ -22,6 +22,70 @@ QUEST_WORLD_SIZE_BYTES = 100 * 1024 * 1024
 
 
 @dataclass
+class OptimizePreset:
+    """One Quest-optimizer preset: how much to keep, and the hard caps.
+
+    Reduction is a ratio *with a floor and a ceiling*, never an
+    unbounded percentage: ``keep_ratio`` is the fraction of triangles
+    kept, ``per_asset_tri_cap`` is the absolute ceiling for one asset
+    (a 300k-triangle hero prop at Balanced still stops at 50k).
+    """
+
+    name: str
+    keep_ratio: float  # fraction of triangles kept (0.10–0.90)
+    max_texture_px: int  # longest texture side allowed
+    per_asset_tri_cap: int  # absolute triangle ceiling per asset
+
+    def target_triangles(self, triangles: int | None) -> int | None:
+        """Triangles to aim for, or None when no decimation is needed.
+
+        None means "leave the mesh alone": unknown count, already at
+        or below the floor (decimating a 12-triangle cube saves
+        nothing), or already at/below both the ratio target and the cap.
+        """
+        if triangles is None or triangles <= MIN_DECIMATE_TRIANGLES:
+            return None
+        target = min(int(triangles * self.keep_ratio), self.per_asset_tri_cap)
+        return target if target < triangles else None
+
+
+# Default per-asset ceiling (the Balanced cap): a single prop should
+# never eat a fifth of the 250k Quest world budget on its own.
+QUEST_PER_ASSET_CAP = 50_000
+
+# Decimating a mesh this small saves nothing and only risks breaking
+# it: a 12-triangle cube is never "optimized" to 6 triangles. Below
+# the floor the mesh is already negligible (0.04% of the world budget)
+# and is copied unchanged.
+MIN_DECIMATE_TRIANGLES = 100
+
+PRESETS: dict[str, OptimizePreset] = {
+    "Gentle": OptimizePreset("Gentle", 0.75, 1024, 100_000),
+    "Balanced": OptimizePreset("Balanced", 0.50, 1024, 50_000),
+    "Aggressive": OptimizePreset("Aggressive", 0.25, 512, 20_000),
+}
+DEFAULT_PRESET_NAME = "Balanced"
+
+
+def preset_for(name: str) -> OptimizePreset:
+    """The named preset, or the default when the name is unknown."""
+    return PRESETS.get(name, PRESETS[DEFAULT_PRESET_NAME])
+
+
+def custom_preset(
+    keep_ratio: float, max_texture_px: int, per_asset_tri_cap: int
+) -> OptimizePreset:
+    """A user-tuned preset; ratios outside 10–90% are rejected, not clamped."""
+    if not 0.10 <= keep_ratio <= 0.90:
+        raise ValueError(f"keep_ratio must be 0.10–0.90, got {keep_ratio}")
+    if max_texture_px not in (256, 512, 1024, 2048):
+        raise ValueError(f"max_texture_px must be 256/512/1024/2048, got {max_texture_px}")
+    if per_asset_tri_cap <= 0:
+        raise ValueError("per_asset_tri_cap must be positive")
+    return OptimizePreset("Custom", keep_ratio, max_texture_px, per_asset_tri_cap)
+
+
+@dataclass
 class AssetStats:
     triangles: int | None = None  # None = unknown (e.g. .blend, not parsed yet)
     materials: int | None = None

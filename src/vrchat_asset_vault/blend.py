@@ -23,6 +23,9 @@ Public API (integration points — see the report for the call sites):
 - ``find_blender() -> Path | None``
 - ``blend_stats(path, timeout=120) -> dict | None``
 - ``blend_thumbnail(path, cache_dir, size=192, timeout=180) -> Path | None``
+- ``blender_optimize(src, out_path, keep_ratio=0.5, cap=50000,
+  max_texture_px=1024, ...) -> dict | None`` — one-click Quest
+  optimizer engine (see blend_optimize.py, run inside Blender).
 - ``unavailable_reason() -> str | None`` (why the last call returned None)
 """
 from __future__ import annotations
@@ -46,6 +49,7 @@ THUMBNAIL_TIMEOUT = 180
 LAST_ERROR: str | None = None
 
 _PROBE = Path(__file__).with_name("blend_probe.py")
+_OPTIMIZE = Path(__file__).with_name("blend_optimize.py")
 
 # Typical Blender install locations, checked after PATH.
 _CANDIDATE_DIRS = [
@@ -308,6 +312,183 @@ def blend_thumbnail(
             return None
     LAST_ERROR = None
     return out
+
+
+def _parse_optimize_json(text: str) -> dict | None:
+    """Parse an optimize report (raw JSON or a BLEND_OPTIMIZE_JSON: line)."""
+    text = text.strip()
+    if not text:
+        return None
+    marker = "BLEND_OPTIMIZE_JSON:"
+    if marker in text:
+        text = text[text.index(marker) + len(marker):].strip()
+    try:
+        data, _ = json.JSONDecoder().raw_decode(text)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def blender_optimize(
+    src: Path | str,
+    out_path: Path | str,
+    keep_ratio: float = 0.5,
+    cap: int = 50_000,
+    max_texture_px: int = 1024,
+    source_scale: float | None = None,
+    min_triangles: int = 100,
+    timeout: float = DEFAULT_TIMEOUT,
+    cancel_event=None,
+    snapshots: bool = False,
+) -> dict | None:
+    """Optimize one model with Blender headless (see blend_optimize.py).
+
+    Returns the report dict from the bpy script — ``status`` is
+    "optimized", "unchanged" (nothing to do; the caller copies the
+    original instead), "skipped" (shape keys / armature / animation)
+    or "failed" — or None when Blender could not run at all (see
+    ``unavailable_reason()``). A cancelled run returns None with
+    LAST_ERROR "cancelled by user" and no partial output file.
+
+    The source file is never saved or modified; only ``out_path``
+    (and its textures, with path_mode COPY) is written.
+    """
+    import time
+
+    global LAST_ERROR
+    LAST_ERROR = None
+    blender = find_blender()
+    if blender is None:
+        LAST_ERROR = (
+            "Blender not found — install Blender and make sure 'blender' "
+            "is on PATH, or set BLENDER_PATH to the Blender binary."
+        )
+        return None
+    src = Path(src)
+    out_path = Path(out_path)
+    if not src.is_file():
+        LAST_ERROR = f"file not found: {src}"
+        return None
+    if not _OPTIMIZE.is_file():
+        LAST_ERROR = f"optimize script missing: {_OPTIMIZE}"
+        return None
+
+    with tempfile.TemporaryDirectory(prefix="vault-optimize-") as tmp:
+        tmp = Path(tmp)
+        report_json = tmp / "optimize.json"
+        snap_dir = tmp / "snaps"
+        if snapshots:
+            snap_dir.mkdir()
+        cmd = [str(blender), "--background"]
+        if src.suffix.lower() == ".blend":
+            cmd.append(str(src))
+        cmd += [
+            "--python",
+            str(_OPTIMIZE),
+            "--",
+            "--out",
+            str(out_path),
+            "--keep-ratio",
+            str(keep_ratio),
+            "--cap",
+            str(cap),
+            "--max-tex",
+            str(max_texture_px),
+            "--min-triangles",
+            str(min_triangles),
+            "--report",
+            str(report_json),
+        ]
+        if src.suffix.lower() != ".blend":
+            cmd += ["--input", str(src)]
+        if source_scale is not None:
+            cmd += ["--source-scale", str(source_scale)]
+        if snapshots:
+            cmd += ["--snapshots", str(snap_dir)]
+
+        log_path = tmp / "blender.log"
+        try:
+            log_file = log_path.open("w", encoding="utf-8")
+        except OSError as exc:
+            LAST_ERROR = f"could not start Blender log: {exc}"
+            return None
+        try:
+            proc = subprocess.Popen(cmd, stdout=log_file, stderr=subprocess.STDOUT)
+        except OSError as exc:
+            log_file.close()
+            LAST_ERROR = f"could not start Blender ({blender}): {exc}"
+            return None
+        start = time.monotonic()
+        rc = None
+        while rc is None:
+            rc = proc.poll()
+            if rc is not None:
+                break
+            if cancel_event is not None and cancel_event.is_set():
+                proc.kill()
+                proc.wait()
+                log_file.close()
+                LAST_ERROR = "cancelled by user"
+                return None
+            if time.monotonic() - start > timeout:
+                proc.kill()
+                proc.wait()
+                log_file.close()
+                LAST_ERROR = (
+                    f"Blender timed out after {timeout:.0f}s while optimizing "
+                    f"{src.name} — file skipped."
+                )
+                return None
+            time.sleep(0.2)
+        log_file.close()
+
+        data = None
+        if report_json.is_file():
+            data = _parse_optimize_json(report_json.read_text(encoding="utf-8"))
+        if data is None:
+            try:
+                data = _parse_optimize_json(log_path.read_text(encoding="utf-8"))
+            except OSError:
+                data = None
+        if data is None:
+            LAST_ERROR = (
+                f"Blender ran but produced no usable report for "
+                f"{src.name} (exit {rc}) — see the Blender log."
+            )
+            return None
+        if data.get("error"):
+            LAST_ERROR = f"Blender optimize failed for {src.name}: {data['error']}"
+            return None
+        if data.get("status") == "failed":
+            LAST_ERROR = (
+                f"Blender optimize failed for {src.name}: "
+                f"{data.get('error') or data.get('reason') or 'unknown error'}"
+            )
+            return None
+
+        # Thumbnail diff from the before/after OBJ snapshots: the same
+        # 3/4 view the Vault renders for every other format, so the
+        # optimizer can flag a changed silhouette on the Blender path
+        # too. Advisory only — a missing snapshot never fails the run.
+        if snapshots:
+            before_obj = snap_dir / "before.obj"
+            after_obj = snap_dir / "after.obj"
+            if before_obj.is_file() and after_obj.is_file():
+                try:
+                    from .preview import mesh_geometry, png_diff_fraction, render_png
+
+                    g0 = mesh_geometry(before_obj)
+                    g1 = mesh_geometry(after_obj)
+                    if g0 is not None and g1 is not None:
+                        diff = png_diff_fraction(
+                            render_png(g0[0], g0[1], size=96),
+                            render_png(g1[0], g1[1], size=96),
+                        )
+                        if diff is not None:
+                            data["thumbnail_diff"] = diff
+                except Exception:
+                    pass
+        return data
 
 
 if __name__ == "__main__":  # pragma: no cover - manual smoke check

@@ -29,15 +29,23 @@ What the user gets here (v3, 2026-11-13):
   selection, and export of exactly the selected models.
 - .blend stats + thumbnails via Blender headless when Blender is
   installed (graceful "not available" when it is not).
+
+What the user gets here (v4, 2026-11-26):
+- One-click Quest optimizer: preset picker (Gentle / Balanced /
+  Aggressive / Custom), background worker with progress + Cancel,
+  per-asset before/after report, and Open folder / Export optimized
+  to Unity follow-ups. Blender status is shown up front — FBX/.blend
+  need Blender, and the user learns that before starting, not mid-run.
 """
 from __future__ import annotations
 
 import shutil
 import subprocess
+import threading
 from pathlib import Path
 
 try:
-    from PySide6.QtCore import Qt, QSize, QUrl, QSettings
+    from PySide6.QtCore import Qt, QSize, QUrl, QSettings, QThread, Signal
     from PySide6.QtGui import QDesktopServices, QIcon, QKeySequence, QPixmap, QShortcut
     from PySide6.QtWidgets import (
         QApplication,
@@ -57,6 +65,8 @@ try:
         QPushButton,
         QSplitter,
         QStatusBar,
+        QTableWidget,
+        QTableWidgetItem,
         QVBoxLayout,
         QWidget,
     )
@@ -84,16 +94,21 @@ except ImportError as exc:  # GUI is optional in the CLI install
         QLabel
     ) = QListWidget = QListWidgetItem = QLineEdit = QMainWindow = QPixmap = (
         QProgressBar
-    ) = QPushButton = QShortcut = QSize = QSplitter = QStatusBar = QVBoxLayout = (
-        QWidget
-    ) = _MissingQt
+    ) = QPushButton = QShortcut = QSize = QSplitter = QStatusBar = QTableWidget = (
+        QTableWidgetItem
+    ) = QThread = Signal = QVBoxLayout = QWidget = _MissingQt
     PySide6 = None  # type: ignore
 
+from .blend import blender_available
 from .budget import (
+    DEFAULT_PRESET_NAME,
+    PRESETS,
     QUEST_TRIANGLE_BUDGET,
     QUEST_WORLD_SIZE_BYTES,
     check_asset,
+    custom_preset,
     fmt_bytes,
+    preset_for,
     texture_mb_light,
     texture_totals_for,
     traffic_light,
@@ -108,6 +123,7 @@ from .database import (
     upsert_asset,
 )
 from .exporter import export_collection, export_unitypackage
+from .optimizer import OptimizeCancelled, OptimizeReport, optimize_collection
 from .preview import thumbnail_for
 from .scanner import scan
 
@@ -158,6 +174,72 @@ def traffic_dot(status: str) -> str:
     return f'<span style="color:{colour}; font-size:20px">●</span>'
 
 
+class OptimizeWorker(QThread):
+    """Runs optimize_collection off the GUI thread.
+
+    Never touches a widget: it only emits signals, and the window
+    updates itself from them. Cancel is honoured between assets (and
+    inside a running Blender subprocess, via the shared event).
+    """
+
+    asset_done = Signal(dict)
+    progress = Signal(int, int)
+    finished_ok = Signal(dict)
+    cancelled = Signal(dict)
+
+    def __init__(
+        self,
+        paths,
+        out_dir: Path,
+        world: str,
+        preset,
+        meta_by_path: dict,
+        favorites,
+        engine: str = "auto",
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.paths = [Path(p) for p in paths]
+        self.out_dir = Path(out_dir)
+        self.world = world
+        self.preset = preset
+        self.meta_by_path = meta_by_path
+        self.favorites = set(favorites)
+        self.engine = engine
+        self._cancel = threading.Event()
+
+    def cancel(self) -> None:
+        self._cancel.set()
+
+    def _summary(self, reports) -> dict:
+        return OptimizeReport(
+            self.world, self.preset, self.out_dir, reports
+        ).to_dict()
+
+    def run(self) -> None:
+        reports = []
+        try:
+            for i, rep in enumerate(
+                optimize_collection(
+                    self.paths,
+                    self.out_dir,
+                    self.world,
+                    self.preset,
+                    meta_by_path=self.meta_by_path,
+                    favorites=self.favorites,
+                    engine=self.engine,
+                    cancel_event=self._cancel,
+                )
+            ):
+                reports.append(rep)
+                self.asset_done.emit(rep.to_dict())
+                self.progress.emit(i + 1, len(self.paths))
+        except OptimizeCancelled:
+            self.cancelled.emit(self._summary(reports))
+            return
+        self.finished_ok.emit(self._summary(reports))
+
+
 class MainWindow(QMainWindow):
     """One window: top bar, filters, collections | cards | detail, status bar."""
 
@@ -175,6 +257,14 @@ class MainWindow(QMainWindow):
         self.selected_assets: list = []
         self.db_path = Path.home() / ".vrchat_asset_vault" / "vault.db"
         self.thumb_dir = self.db_path.parent / "thumbnails"
+        # Optimizer run state.
+        self.optimize_worker = None
+        self.optimize_reports: list[dict] = []
+        self.last_optimized_dir: Path | None = None
+        self.last_optimize_summary: dict | None = None
+        self.last_optimized_paths: list[Path] = []
+        self.pending_optimize_assets: list = []
+        self.pending_optimize_world: str = "World"
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -218,6 +308,30 @@ class MainWindow(QMainWindow):
         filters.addWidget(self.fav_only)
         filters.addStretch(1)
         layout.addLayout(filters)
+
+        # --- Optimizer row: preset picker + Blender status, up front.
+        # FBX/.blend need Blender; the user learns that here, before
+        # pressing any button, never mid-run.
+        opt_row = QHBoxLayout()
+        opt_row.addWidget(QLabel("Optimize preset:"))
+        self.custom_preset = None
+        self.preset_combo = QComboBox()
+        self.preset_combo.addItems(["Gentle", "Balanced", "Aggressive", "Custom"])
+        saved_preset = str(
+            self.settings.value("optimize_preset", DEFAULT_PRESET_NAME)
+        )
+        # Custom values are not persisted — a saved "Custom" falls
+        # back to the default until the user re-picks it.
+        if saved_preset not in PRESETS:
+            saved_preset = DEFAULT_PRESET_NAME
+        self.preset_combo.setCurrentText(saved_preset)
+        self.preset_combo.currentTextChanged.connect(self._on_preset_changed)
+        opt_row.addWidget(self.preset_combo)
+        self.blender_status_label = QLabel("")
+        opt_row.addWidget(self.blender_status_label)
+        opt_row.addStretch(1)
+        layout.addLayout(opt_row)
+        self._refresh_blender_status()
 
         # --- Middle: collections | cards | detail.
         splitter = QSplitter(Qt.Horizontal)
@@ -336,16 +450,53 @@ class MainWindow(QMainWindow):
         self.copy_path_btn.clicked.connect(self.copy_path)
         self.remove_btn = QPushButton("Remove from library")
         self.remove_btn.clicked.connect(self.remove_from_library)
+        self.optimize_btn = QPushButton("Optimize for Quest")
+        self.optimize_btn.setToolTip(
+            "Make the selected model(s) Quest-ready: decimate meshes, "
+            "downscale textures, fix FBX scale — originals untouched"
+        )
+        self.optimize_btn.clicked.connect(self.optimize_preflight)
+        self.start_optimize_btn = QPushButton("Start optimization")
+        self.start_optimize_btn.setToolTip("Run the optimizer on the models above")
+        self.start_optimize_btn.clicked.connect(self.start_optimization)
+        self.start_optimize_btn.hide()
+        self.cancel_optimize_btn = QPushButton("Cancel optimization")
+        self.cancel_optimize_btn.clicked.connect(self.cancel_optimization)
+        self.cancel_optimize_btn.hide()
+        self.open_optimized_btn = QPushButton("Open optimized folder")
+        self.open_optimized_btn.clicked.connect(self.open_optimized_folder)
+        self.open_optimized_btn.hide()
+        self.export_optimized_btn = QPushButton("Export optimized to Unity")
+        self.export_optimized_btn.setToolTip(
+            "Export the optimized models (not the originals) for Unity"
+        )
+        self.export_optimized_btn.clicked.connect(self.export_optimized_to_unity)
+        self.export_optimized_btn.hide()
         for btn in (
             self.export_btn,
             self.export_collection_btn,
             self.export_package_btn,
+            self.optimize_btn,
+            self.start_optimize_btn,
+            self.cancel_optimize_btn,
+            self.open_optimized_btn,
+            self.export_optimized_btn,
             self.open_blender_btn,
             self.show_folder_btn,
             self.copy_path_btn,
             self.remove_btn,
         ):
             detail_layout.addWidget(btn)
+
+        # Per-asset optimization report: before → after, status, notes.
+        self.report_table = QTableWidget()
+        self.report_table.setColumnCount(6)
+        self.report_table.setHorizontalHeaderLabels(
+            ["Asset", "Triangles", "Textures", "Status", "Engine", "Notes"]
+        )
+        self.report_table.setSortingEnabled(True)
+        self.report_table.hide()
+        detail_layout.addWidget(self.report_table)
         detail_layout.addStretch(1)
         splitter.addWidget(detail)
 
@@ -355,6 +506,12 @@ class MainWindow(QMainWindow):
         # --- Status bar: always true, always visible.
         self.setStatusBar(QStatusBar())
         self.statusBar().showMessage("Library: not chosen yet — click Add folder")
+        self.optimize_progress = QProgressBar()
+        self.optimize_progress.setRange(0, 100)
+        self.optimize_progress.setValue(0)
+        self.optimize_progress.setMaximumWidth(220)
+        self.optimize_progress.hide()
+        self.statusBar().addPermanentWidget(self.optimize_progress)
 
         # Shortcuts.
         QShortcut(QKeySequence("Ctrl+O"), self).activated.connect(self.choose_folder)
@@ -915,6 +1072,243 @@ class MainWindow(QMainWindow):
         self.detail_title.setText("Select a model")
         self.detail_body.setText(f"{name} removed from the index. The file on disk was NOT deleted.")
         self.statusBar().showMessage(f"Removed {name} from the library index.")
+
+
+    # --- Optimizer (one-click Quest) ---
+
+    def _refresh_blender_status(self) -> None:
+        if blender_available():
+            self.blender_status_label.setText(
+                "Blender: found — FBX/.blend will optimize"
+            )
+        else:
+            self.blender_status_label.setText(
+                "Blender: not found — FBX/.blend will be skipped "
+                "(OBJ/GLB still work). Install Blender from blender.org."
+            )
+
+    def _on_preset_changed(self, name: str) -> None:
+        if name == "Custom":
+            keep, ok = QInputDialog.getInt(
+                self, "Custom preset",
+                "Keep how much of the triangles? (%)", 50, 10, 90,
+            )
+            if not ok:
+                self.preset_combo.setCurrentText(DEFAULT_PRESET_NAME)
+                return
+            tex, ok = QInputDialog.getItem(
+                self, "Custom preset", "Max texture side (px):",
+                ["256", "512", "1024"], 2, False,
+            )
+            if not ok:
+                self.preset_combo.setCurrentText(DEFAULT_PRESET_NAME)
+                return
+            try:
+                self.custom_preset = custom_preset(
+                    keep / 100.0, int(tex), 50_000
+                )
+            except ValueError:
+                self.preset_combo.setCurrentText(DEFAULT_PRESET_NAME)
+                return
+        self.settings.setValue("optimize_preset", name)
+
+    def current_preset(self):
+        name = self.preset_combo.currentText()
+        if name == "Custom" and self.custom_preset is not None:
+            return self.custom_preset
+        return preset_for(name)
+
+    def optimize_preflight(self) -> None:
+        """What will happen, before anything runs (plan §4)."""
+        assets = self.selected_assets or self.visible_assets()
+        if not assets:
+            self.statusBar().showMessage(
+                "Nothing to optimize — select a model or a collection first."
+            )
+            return
+        if self.optimize_worker is not None and self.optimize_worker.isRunning():
+            self.statusBar().showMessage("An optimization is already running.")
+            return
+        self.pending_optimize_assets = list(assets)
+        self.pending_optimize_world = self.current_collection() or "World"
+        preset = self.current_preset()
+        blender = blender_available()
+        skipped = [
+            a for a in assets
+            if a.path.suffix.lower() in {".fbx", ".blend"} and not blender
+        ]
+        lines = [
+            f"Optimize {len(assets)} model(s) — preset {preset.name} "
+            f"(keep {int(preset.keep_ratio * 100)}% of triangles, "
+            f"textures ≤{preset.max_texture_px}px, per-asset cap "
+            f"{preset.per_asset_tri_cap:,} tris).",
+            "Blender: "
+            + ("found — FBX/.blend will optimize" if blender else "not found"),
+        ]
+        if skipped:
+            names = ", ".join(a.path.name for a in skipped[:5])
+            lines.append(f"{len(skipped)} will be skipped (no Blender): {names}.")
+        lines.append(
+            "Originals are never modified — optimized copies go to "
+            "Optimized_&lt;world&gt;/, with a report."
+        )
+        lines.append("Press Start optimization to run it.")
+        self.detail_body.setText("<br/>".join(lines))
+        self.detail_title.setText("Optimize for Quest — ready")
+        self.optimize_btn.hide()
+        self.start_optimize_btn.show()
+        self.open_optimized_btn.hide()
+        self.export_optimized_btn.hide()
+        self.report_table.hide()
+
+    def start_optimization(self) -> None:
+        assets = self.pending_optimize_assets
+        if not assets:
+            return
+        out = QFileDialog.getExistingDirectory(
+            self, "Choose where to save the optimized models"
+        )
+        if not out:
+            return
+        world = self.pending_optimize_world
+        out_dir = Path(out) / f"Optimized_{world}"
+        preset = self.current_preset()
+        self.optimize_reports = []
+        self.report_table.setRowCount(0)
+        self.report_table.show()
+        self.start_optimize_btn.hide()
+        self.cancel_optimize_btn.show()
+        self.optimize_progress.setRange(0, len(assets))
+        self.optimize_progress.setValue(0)
+        self.optimize_progress.show()
+        self.statusBar().showMessage(f"Optimizing {len(assets)} model(s)…")
+        favorites = {p for p, m in self.meta.items() if m.get("favorite")}
+        worker = OptimizeWorker(
+            [a.path for a in assets],
+            out_dir,
+            world,
+            preset,
+            meta_by_path=self._meta_for([a.path for a in assets]),
+            favorites=favorites,
+            engine="auto",
+            parent=self,
+        )
+        worker.asset_done.connect(self._on_optimize_asset_done)
+        worker.progress.connect(self._on_optimize_progress)
+        worker.finished_ok.connect(
+            lambda s: self._on_optimize_finished(s, cancelled=False)
+        )
+        worker.cancelled.connect(
+            lambda s: self._on_optimize_finished(s, cancelled=True)
+        )
+        self.optimize_worker = worker
+        worker.start()
+
+    def cancel_optimization(self) -> None:
+        if self.optimize_worker is not None:
+            self.optimize_worker.cancel()
+            self.statusBar().showMessage(
+                "Cancelling — finishing the current model…"
+            )
+
+    def _on_optimize_asset_done(self, rep: dict) -> None:
+        self.optimize_reports.append(rep)
+        row = self.report_table.rowCount()
+        self.report_table.insertRow(row)
+        tris = (
+            f"{rep['triangles_before']:,} → {rep['triangles_after']:,}"
+            if rep["triangles_before"] is not None
+            and rep["triangles_after"] is not None
+            else "?"
+        )
+        tex = (
+            f"{fmt_bytes(rep['texture_bytes_before'])} → "
+            f"{fmt_bytes(rep['texture_bytes_after'])}"
+        )
+        notes = rep["reason"] or "; ".join(rep["warnings"][:2])
+        if rep["check_visually"]:
+            notes = ("check visually — " + notes) if notes else "check visually"
+        for col, text in enumerate(
+            [
+                Path(rep["source"]).name,
+                tris,
+                tex,
+                rep["status"],
+                rep["engine"],
+                notes,
+            ]
+        ):
+            self.report_table.setItem(row, col, QTableWidgetItem(str(text)))
+
+    def _on_optimize_progress(self, done: int, total: int) -> None:
+        self.optimize_progress.setRange(0, total)
+        self.optimize_progress.setValue(done)
+        self.statusBar().showMessage(f"Optimizing… {done}/{total} models")
+
+    def _on_optimize_finished(self, summary: dict, cancelled: bool = False) -> None:
+        self.optimize_progress.hide()
+        self.cancel_optimize_btn.hide()
+        self.optimize_btn.show()
+        self.optimize_worker = None
+        totals = summary["totals"]
+        self.last_optimized_dir = Path(summary["out_dir"])
+        self.last_optimize_summary = summary
+        self.last_optimized_paths = [
+            Path(a["output"]) for a in summary["assets"] if a.get("output")
+        ]
+        self.open_optimized_btn.show()
+        self.export_optimized_btn.show()
+        self.report_table.resizeColumnsToContents()
+        lines = [
+            f"{'Cancelled — partial results' if cancelled else 'Optimization finished'}: "
+            f"{totals['assets']} model(s), "
+            f"{totals['triangles_before']:,} → {totals['triangles_after']:,} triangles, "
+            f"textures {fmt_bytes(totals['texture_bytes_before'])} → "
+            f"{fmt_bytes(totals['texture_bytes_after'])}.",
+        ]
+        lines += summary["warnings"]
+        lines.append(f"Report: {summary['out_dir']}/optimization_report.json")
+        self.detail_body.setText("<br/>".join(lines))
+        self.detail_title.setText("Optimize for Quest — report")
+        msg = (
+            "Optimization cancelled — partial results saved."
+            if cancelled
+            else f"Optimized {totals['assets']} model(s) → {summary['out_dir']}"
+        )
+        self.statusBar().showMessage(msg)
+
+    def open_optimized_folder(self) -> None:
+        if self.last_optimized_dir is None:
+            return
+        QDesktopServices.openUrl(
+            QUrl.fromLocalFile(str(self.last_optimized_dir))
+        )
+
+    def export_optimized_to_unity(self) -> None:
+        """Export the optimized models (not the originals) for Unity."""
+        if not self.last_optimized_paths or self.last_optimize_summary is None:
+            self.statusBar().showMessage("Nothing optimized yet.")
+            return
+        out = QFileDialog.getExistingDirectory(
+            self, "Choose where to export for Unity"
+        )
+        if not out:
+            return
+        world = self.pending_optimize_world
+        out_dir = Path(out) / f"Export_{world}"
+        meta = {
+            a["output"]: {k: a.get(k, "") for k in ("source", "author", "url", "license", "tags")}
+            for a in self.last_optimize_summary["assets"]
+            if a.get("output")
+        }
+        result = export_collection(
+            self.last_optimized_paths, out_dir, world, meta_by_path=meta
+        )
+        message = f"Exported {result['assets']} optimized model(s) to {result['out_dir']}"
+        if result["warnings"]:
+            message += "\n\n" + "\n".join(f"! {w}" for w in result["warnings"][:5])
+        self.detail_body.setText(message)
+        self.statusBar().showMessage(message.split("\n")[0])
 
 
 def run() -> int:

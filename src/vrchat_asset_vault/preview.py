@@ -249,6 +249,77 @@ def _fill_triangle(pixels: bytearray, size: int, pa, pb, pc, colour) -> None:
             pixels[i + 2] = colour[2]
 
 
+def png_diff_fraction(png_a: bytes, png_b: bytes, threshold: int = 12) -> float | None:
+    """Fraction of pixels that differ between two ``render_png`` images.
+
+    The optimizer renders the same 3/4 view before and after
+    decimation; a big silhouette change means the decimator hurt the
+    model even if the triangle numbers look fine. Returns None when
+    either image cannot be decoded (the caller then skips the check
+    instead of failing the asset over a thumbnail).
+    """
+    a = _decode_render_png(png_a)
+    b = _decode_render_png(png_b)
+    if a is None or b is None or a[0] != b[0]:
+        return None
+    (size, px_a), (_, px_b) = a, b
+    changed = 0
+    total = size * size
+    for i in range(0, len(px_a), 3):
+        if (
+            abs(px_a[i] - px_b[i]) > threshold
+            or abs(px_a[i + 1] - px_b[i + 1]) > threshold
+            or abs(px_a[i + 2] - px_b[i + 2]) > threshold
+        ):
+            changed += 1
+    return changed / total if total else 0.0
+
+
+def _decode_render_png(data: bytes):
+    """(size, RGB bytearray) for a PNG written by ``render_png``.
+
+    Only the writer's own layout is supported: 8-bit RGB, filter 0
+    on every row. Anything else returns None — the diff is advisory,
+    never a reason to crash.
+    """
+    if len(data) < 8 or data[:8] != b"\x89PNG\r\n\x1a\n":
+        return None
+    pos = 8
+    width = height = 0
+    idat = bytearray()
+    while pos + 8 <= len(data):
+        (length,) = struct.unpack(">I", data[pos : pos + 4])
+        tag = data[pos + 4 : pos + 8]
+        chunk = data[pos + 8 : pos + 8 + length]
+        if tag == b"IHDR":
+            if length < 13:
+                return None
+            width, height, depth, colour = struct.unpack(">IIBB", chunk[:10])
+            if depth != 8 or colour != 2 or width != height:
+                return None
+        elif tag == b"IDAT":
+            idat += chunk
+        elif tag == b"IEND":
+            break
+        pos += 8 + length + 4
+    if not width or not idat:
+        return None
+    try:
+        raw = zlib.decompress(bytes(idat))
+    except zlib.error:
+        return None
+    stride = width * 3
+    if len(raw) < height * (stride + 1):
+        return None
+    pixels = bytearray(height * stride)
+    for y in range(height):
+        row = raw[y * (stride + 1) : (y + 1) * (stride + 1)]
+        if not row or row[0] != 0:  # render_png writes filter 0 only
+            return None
+        pixels[y * stride : (y + 1) * stride] = row[1 : stride + 1]
+    return width, pixels
+
+
 def thumbnail_for(model_path: Path, cache_dir: Path, size: int = 192) -> Path | None:
     """Cached PNG thumbnail for a model (generated once, by sha256).
 

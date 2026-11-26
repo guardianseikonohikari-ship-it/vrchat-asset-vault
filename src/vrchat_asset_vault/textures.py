@@ -12,6 +12,7 @@ they return None and the card says so honestly.
 """
 from __future__ import annotations
 
+import shutil
 import struct
 from pathlib import Path
 
@@ -105,3 +106,107 @@ def texture_stats_for(model_path: Path) -> dict:
         if size is not None:
             max_px = max(max_px or 0, size[0], size[1])
     return {"count": len(textures), "max_px": max_px, "total_bytes": total}
+
+
+# Formats Pillow can read AND write (so a downscale is a real file,
+# not a renamed one). EXR / HDR / DDS are read by nothing in pure
+# Python and are copied as-is by the optimizer, with a warning.
+DOWNSCALABLE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tga", ".tiff"}
+
+
+def downscale_texture(src: Path, dst: Path, max_px: int) -> dict:
+    """Downscale one texture so its longest side is at most ``max_px``.
+
+    Returns {"status", "size_before", "size_after", "bytes_before",
+    "bytes_after", "warning"} where status is one of:
+    - "downscaled": resized with LANCZOS, aspect kept, alpha kept.
+    - "unchanged": already within the limit — copied byte-identical.
+    - "copied": format Pillow cannot downscale (EXR/HDR/DDS) or
+      Pillow is not installed — copied as-is, with a warning.
+    - "failed": the file could not be read or written at all.
+
+    Never raises for a bad file: the optimizer must keep going and
+    report, not crash the whole collection over one texture.
+    """
+    result = {
+        "status": "failed",
+        "size_before": None,
+        "size_after": None,
+        "bytes_before": 0,
+        "bytes_after": 0,
+        "warning": None,
+    }
+    try:
+        result["bytes_before"] = src.stat().st_size
+    except OSError as exc:
+        result["warning"] = f"could not read {src.name}: {exc}"
+        return result
+    result["size_before"] = probe_image_size(src)
+
+    if src.suffix.lower() not in DOWNSCALABLE_EXTS:
+        try:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dst)
+        except OSError as exc:
+            result["warning"] = f"could not copy {src.name}: {exc}"
+            return result
+        result["status"] = "copied"
+        result["size_after"] = result["size_before"]
+        result["bytes_after"] = result["bytes_before"]
+        result["warning"] = (
+            f"{src.name} left at full size — {src.suffix} cannot be "
+            "downscaled without Blender."
+        )
+        return result
+
+    try:
+        from PIL import Image
+    except ImportError:
+        try:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dst)
+        except OSError as exc:
+            result["warning"] = f"could not copy {src.name}: {exc}"
+            return result
+        result["status"] = "copied"
+        result["size_after"] = result["size_before"]
+        result["bytes_after"] = result["bytes_before"]
+        result["warning"] = (
+            f"{src.name} left at full size — Pillow is not installed "
+            "(install vrchat-asset-vault[optimize])."
+        )
+        return result
+
+    try:
+        with Image.open(src) as img:
+            width, height = img.size
+            result["size_before"] = (width, height)
+            longest = max(width, height)
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            if longest <= max_px:
+                shutil.copy2(src, dst)
+                result["status"] = "unchanged"
+                result["size_after"] = (width, height)
+                result["bytes_after"] = result["bytes_before"]
+                return result
+            scale = max_px / longest
+            new_size = (max(1, int(width * scale)), max(1, int(height * scale)))
+            # JPEG has no alpha; RGBA/P images must become RGB first.
+            if src.suffix.lower() in {".jpg", ".jpeg"} and img.mode in ("RGBA", "LA", "P"):
+                img = img.convert("RGB")
+            resized = img.resize(new_size, Image.LANCZOS)
+            fmt = {"png": "PNG", "jpg": "JPEG", "jpeg": "JPEG", "bmp": "BMP",
+                   "tga": "TGA", "tiff": "TIFF"}[src.suffix.lower().lstrip(".")]
+            save_kw: dict = {}
+            if fmt == "PNG":
+                save_kw["optimize"] = True
+            elif fmt == "JPEG":
+                save_kw["quality"] = 90
+            resized.save(dst, fmt, **save_kw)
+            result["status"] = "downscaled"
+            result["size_after"] = new_size
+            result["bytes_after"] = dst.stat().st_size
+            return result
+    except Exception as exc:  # corrupt image, unsupported mode, disk error
+        result["warning"] = f"could not downscale {src.name}: {exc}"
+        return result
