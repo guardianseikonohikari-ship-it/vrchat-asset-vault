@@ -48,11 +48,21 @@ found; evidence is qualitative and documented in the research notes.
 
 - Store sync (Booth/Gumroad/Jinxxy login + scraping): Hoard does it
   free and open source; fragile against store changes.
-- Decimation / optimization inside the app: Blender Decimate, CATS
-  and VRWorldToolkit already do it; bad decimation destroys a model.
+- Texture atlasing / LODs / avatars in the optimizer: atlasing
+  rewrites UVs (high risk, low v1 value), LODs are a second feature,
+  and avatars (rigged / blendshaped meshes) must never be decimated
+  by an automatic tool — the optimizer refuses them with a reason.
 - Full PBR viewer, AI search, cloud/collaboration, model store:
   scope and cost explode; a simple orbit/wireframe thumbnail is enough.
 - Bundled models: never, for licensing reasons.
+
+Decimation used to be on this list ("Blender Decimate, CATS and
+VRWorldToolkit already do it; bad decimation destroys a model").
+It landed in v0.4 (below) because the gap the research found was
+real — free, open source, local-first, *before* import, at the
+library level — and the risk is contained by the verification gate
+(copy-only originals, triangle/texture/bbox/silhouette checks,
+fail-safe copy on any failed check).
 
 ## v0.2 (2026-11-13) — P0 gaps closed
 
@@ -92,6 +102,53 @@ scan speed with many `.blend` files (one Blender start each — a
 background worker is the fix, not in scope); full-scene validation
 (draw calls, 45 FPS) stays with the VRChat SDK / VRWorldToolkit,
 as the research warned the Vault must not promise it.
+
+## v0.4 (2026-11-26) — One-click Quest optimizer
+
+The most-demanded next feature, verified 2026-11-25 against VRChat
+docs (Quest content is a challenge; the 100 MB world cap and large
+textures are the main culprits) and paid tools proving demand
+(Polytool 2, $25, 456 ratings; Synthos Scene Optimizer). The gap:
+free, open source, local-first, *before* import, at the library
+level — the paid tools live inside Unity, after the world is built.
+
+- **Presets** (`budget.py`): Gentle 75% / 1024px / 100k cap,
+  Balanced 50% / 1024px / 50k cap (default), Aggressive 25% /
+  512px / 20k cap, Custom. A mesh under 100 triangles is never
+  decimated (a 12-triangle cube is not "optimized" to 6).
+- **Engines** (`optimizer.py` + `blend_optimize.py`): Blender
+  headless (bpy Decimate COLLAPSE only, never remesh) is the only
+  FBX round-trip — trimesh cannot read or write FBX at all — and
+  handles FBX/OBJ/GLB/`.blend`; trimesh + fast-simplification is the
+  fallback for OBJ/GLB/GLTF only, with a nearest-vertex UV remap
+  (trimesh's wrapper drops UVs). Pillow downscales textures
+  (PNG/JPG/BMP/TGA; EXR/HDR/DDS are copied + warned).
+- **Scale fix**: old Blender 0.01 FBX files are imported with
+  `global_scale = 1/0.01` (restores the authored size) and
+  re-exported with FBX_SCALE_ALL + bake_space_transform, so the
+  output carries the metre-to-centimetre factor (100.0 for a metre
+  scene) with node scale 1 — never a byte-patch of
+  `UnitScaleFactor`.
+- **Safety** (plan §2): originals are never modified (copies under
+  `Optimized_<World>/`, verified by hash in tests); every output
+  passes a verification gate (triangles within ±5% of target,
+  texture size, bounding box within 1%, silhouette diff) and any
+  failed check falls back to an untouched copy; shape keys /
+  armatures / animations are skipped with a reason; favourites are
+  protected (Aggressive skips, Balanced warns); optimized copies
+  are NOT indexed in the DB; `CREDITS.md` travels with outputs and
+  optimized copies inherit the original license.
+- **CLI + GUI**: `optimize` subcommand and the GUI flow in
+  `docs/GUI.md` share the same engine (`optimize_collection`).
+  114 tests (69 + 45 new: 30 core, 10 Blender-path, 5 GUI),
+  full suite green, including the GUI offscreen.
+
+Still open (not in v0.4): the Blender path is verified end-to-end
+on Linux (Blender 4.2.0) only — the exact Windows check is in the
+v0.4 report (`optimize` on a real collection after `git pull` on
+Windows, Blender on PATH); `.blend` end-to-end on Windows (same
+caveat as v0.3); texture atlasing, LODs and avatars stay out of v1
+by decision (above).
 
 ## Decisions still open for Mochi
 

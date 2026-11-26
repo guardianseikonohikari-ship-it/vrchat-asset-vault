@@ -77,3 +77,19 @@ draws it) when Blender is installed.
 v0.3 additions: Ctrl+click / Shift+click multi-select with combined
 totals in the detail panel; texture-memory totals + heaviest assets
 under the budget bar; FBX UnitScaleFactor shown in the detail panel.
+
+v0.4 additions: one-click Quest optimizer, same principles. The
+Optimize button lives in the detail panel, next to Export — one
+click from the collection, never in a menu. The flow is:
+preset picker (Gentle / Balanced / Aggressive / Custom, with a
+one-line plain-language description of each) -> preflight panel
+("Optimize N model(s) — preset Balanced ... Blender: found", and
+which FBX/.blend files will be skipped if Blender is missing, so
+the user learns that BEFORE starting) -> Start optimization ->
+progress bar in the status bar + Cancel -> per-asset report table
+(file, triangles before -> after, textures before -> after, status,
+engine, notes) -> Open folder / Export optimized to Unity. The
+worker is a QThread that never touches a widget; the window only
+updates from its signals. Cancel finishes the current model and
+keeps the partial report — it never leaves a half-written model
+behind.
