@@ -19,17 +19,26 @@ What the user gets here (v2, 2026-11-13):
 - Export one model or a whole collection to Unity, with a manifest
   that carries origin/license per file.
 - Open in Blender, show in folder, copy path, remove from index.
+
+What the user gets here (v3, 2026-11-13):
+- Texture-memory totals per collection: how close the world is to
+  the 100 MB Quest limit, and which assets are the worst offenders.
+- FBX UnitScaleFactor detection: Blender's 0.01 default is flagged
+  before the model imports 100x too small in Unity.
+- Multi-select (Ctrl+click / Shift+click): combined totals for the
+  selection, and export of exactly the selected models.
+- .blend stats + thumbnails via Blender headless when Blender is
+  installed (graceful "not available" when it is not).
 """
 from __future__ import annotations
 
-import json
 import shutil
 import subprocess
 from pathlib import Path
 
 try:
-    from PySide6.QtCore import Qt, QUrl, QSettings
-    from PySide6.QtGui import QDesktopServices, QKeySequence, QShortcut
+    from PySide6.QtCore import Qt, QSize, QUrl, QSettings
+    from PySide6.QtGui import QDesktopServices, QIcon, QKeySequence, QPixmap, QShortcut
     from PySide6.QtWidgets import (
         QApplication,
         QCheckBox,
@@ -55,6 +64,10 @@ try:
     _QT_AVAILABLE = True
     _QT_ERROR: Exception | None = None
 except ImportError as exc:  # GUI is optional in the CLI install
+    # Do NOT leave the Qt names undefined: that used to crash the import
+    # with a confusing NameError instead of a clear message. A missing
+    # Qt (e.g. libEGL.so.1 on Linux) is an ImportError here, and the
+    # dummy base below turns it into a readable RuntimeError on use.
     _QT_AVAILABLE = False
     _QT_ERROR = exc
 
@@ -65,23 +78,37 @@ except ImportError as exc:  # GUI is optional in the CLI install
                 "Install it with: pip install vrchat-asset-vault[gui]"
             )
 
-    Qt = QUrl = QSettings = QDesktopServices = QKeySequence = QApplication = (
+    Qt = QUrl = QSettings = QDesktopServices = QIcon = QKeySequence = QApplication = (
         QCheckBox
     ) = QComboBox = QFileDialog = QFormLayout = QFrame = QHBoxLayout = QInputDialog = (
         QLabel
-    ) = QListWidget = QListWidgetItem = QLineEdit = QMainWindow = QProgressBar = (
-        QPushButton
-    ) = QShortcut = QSplitter = QStatusBar = QVBoxLayout = QWidget = _MissingQt
+    ) = QListWidget = QListWidgetItem = QLineEdit = QMainWindow = QPixmap = (
+        QProgressBar
+    ) = QPushButton = QShortcut = QSize = QSplitter = QStatusBar = QVBoxLayout = (
+        QWidget
+    ) = _MissingQt
     PySide6 = None  # type: ignore
 
 from .budget import (
     QUEST_TRIANGLE_BUDGET,
     QUEST_WORLD_SIZE_BYTES,
     check_asset,
+    fmt_bytes,
+    texture_mb_light,
+    texture_totals_for,
+    traffic_light,
     AssetStats,
 )
-from .database import connect, delete_asset, load_meta, update_asset_meta, upsert_asset
-from .exporter import export_collection
+from .database import (
+    connect,
+    delete_asset,
+    load_meta,
+    prune_missing,
+    update_asset_meta,
+    upsert_asset,
+)
+from .exporter import export_collection, export_unitypackage
+from .preview import thumbnail_for
 from .scanner import scan
 
 SOURCES = [
@@ -145,12 +172,15 @@ class MainWindow(QMainWindow):
         self.meta: dict[str, dict] = {}
         self.dup_shas: set[str] = set()
         self.selected_asset = None
+        self.selected_assets: list = []
         self.db_path = Path.home() / ".vrchat_asset_vault" / "vault.db"
+        self.thumb_dir = self.db_path.parent / "thumbnails"
 
         central = QWidget()
         self.setCentralWidget(central)
         layout = QVBoxLayout(central)
 
+        # --- Top bar: the two actions that matter, search always visible.
         top = QHBoxLayout()
         self.add_folder_btn = QPushButton("＋ Add folder")
         self.add_folder_btn.setToolTip("Choose a folder with your 3D models (Ctrl+O)")
@@ -171,6 +201,7 @@ class MainWindow(QMainWindow):
         top.addWidget(self.sort_combo)
         layout.addLayout(top)
 
+        # --- Filters row: format, traffic light, favorites only.
         filters = QHBoxLayout()
         filters.addWidget(QLabel("Format:"))
         self.format_combo = QComboBox()
@@ -188,6 +219,7 @@ class MainWindow(QMainWindow):
         filters.addStretch(1)
         layout.addLayout(filters)
 
+        # --- Middle: collections | cards | detail.
         splitter = QSplitter(Qt.Horizontal)
 
         left = QFrame()
@@ -211,11 +243,23 @@ class MainWindow(QMainWindow):
         self.cards = QListWidget()
         self.cards.setViewMode(QListWidget.IconMode)
         self.cards.setResizeMode(QListWidget.Adjust)
+        self.cards.setIconSize(QSize(96, 96))
+        # ExtendedSelection: Ctrl+click adds one card, Shift+click a
+        # range — the detail panel then shows the combined totals.
+        self.cards.setSelectionMode(QListWidget.ExtendedSelection)
         self.cards.itemClicked.connect(self.on_card_clicked)
+        self.cards.itemSelectionChanged.connect(self.on_selection_changed)
         splitter.addWidget(self.cards)
 
         detail = QFrame()
         detail_layout = QVBoxLayout(detail)
+        self.preview_label = QLabel("No preview yet")
+        self.preview_label.setAlignment(Qt.AlignCenter)
+        self.preview_label.setMinimumHeight(200)
+        self.preview_label.setStyleSheet(
+            "background: #eef2f6; border: 1px solid #d0d7de; border-radius: 6px;"
+        )
+        detail_layout.addWidget(self.preview_label)
         self.detail_title = QLabel("Select a model")
         self.detail_title.setWordWrap(True)
         self.detail_body = QLabel(
@@ -226,13 +270,20 @@ class MainWindow(QMainWindow):
         detail_layout.addWidget(self.detail_title)
         detail_layout.addWidget(self.detail_body)
 
+        # World budget bar for the selected collection.
         self.budget_label = QLabel("World budget: no collection selected")
         self.budget_bar = QProgressBar()
         self.budget_bar.setRange(0, 100)
         self.budget_bar.setValue(0)
         detail_layout.addWidget(self.budget_label)
         detail_layout.addWidget(self.budget_bar)
+        # Texture memory: the number that actually blows the 100 MB
+        # Quest limit, plus the worst offenders by name.
+        self.texture_label = QLabel("")
+        self.texture_label.setWordWrap(True)
+        detail_layout.addWidget(self.texture_label)
 
+        # Editable notes: tags, origin, license, collection, favorite.
         form = QFormLayout()
         self.tags_edit = QLineEdit()
         self.tags_edit.setPlaceholderText("furniture, wood, library (comma separated)")
@@ -265,10 +316,18 @@ class MainWindow(QMainWindow):
         meta_btns.addWidget(self.save_meta_btn)
         detail_layout.addLayout(meta_btns)
 
+        # Actions.
         self.export_btn = QPushButton("Export to Unity")
+        self.export_btn.setToolTip("Export the selected model(s) to Unity")
         self.export_btn.clicked.connect(self.export_selected)
         self.export_collection_btn = QPushButton("Export collection to Unity")
         self.export_collection_btn.clicked.connect(self.export_current_collection)
+        self.export_package_btn = QPushButton("Export .unitypackage")
+        self.export_package_btn.setToolTip(
+            "One file Unity opens on double-click — the selected models, "
+            "or the current collection when nothing is selected"
+        )
+        self.export_package_btn.clicked.connect(self.export_package)
         self.open_blender_btn = QPushButton("Open in Blender")
         self.open_blender_btn.clicked.connect(self.open_in_blender)
         self.show_folder_btn = QPushButton("Show in folder")
@@ -280,6 +339,7 @@ class MainWindow(QMainWindow):
         for btn in (
             self.export_btn,
             self.export_collection_btn,
+            self.export_package_btn,
             self.open_blender_btn,
             self.show_folder_btn,
             self.copy_path_btn,
@@ -292,16 +352,21 @@ class MainWindow(QMainWindow):
         splitter.setSizes([200, 560, 440])
         layout.addWidget(splitter, stretch=1)
 
+        # --- Status bar: always true, always visible.
         self.setStatusBar(QStatusBar())
         self.statusBar().showMessage("Library: not chosen yet — click Add folder")
 
+        # Shortcuts.
         QShortcut(QKeySequence("Ctrl+O"), self).activated.connect(self.choose_folder)
         QShortcut(QKeySequence("Ctrl+F"), self).activated.connect(self.search.setFocus)
 
+        # Remember the library between sessions.
         last = self.settings.value("library_path")
         if last and Path(str(last)).is_dir():
             self.library_path = Path(str(last))
             self.scan_library()
+
+    # --- Library ---
 
     def _db(self):
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -325,21 +390,33 @@ class MainWindow(QMainWindow):
         for asset in self.assets:
             upsert_asset(conn, asset)
             self.meta[str(asset.path)] = load_meta(conn, str(asset.path))
+        # Files deleted or moved since the last scan leave the index.
+        removed = prune_missing(conn, {str(a.path) for a in self.assets})
+        # Duplicates: same content hash under different paths.
         from collections import Counter
 
         counts = Counter(a.sha256 for a in self.assets)
         self.dup_shas = {sha for sha, n in counts.items() if n > 1}
         conn.close()
+        # Thumbnails are cached by content hash: a rescan never
+        # re-renders an unchanged model.
+        for asset in self.assets:
+            thumbnail_for(asset.path, self.thumb_dir)
         self.refresh_collections()
         self.populate_cards()
         self.update_budget_bar()
         total_tris = sum(a.triangles or 0 for a in self.assets)
         total_mb = sum(a.size_bytes for a in self.assets) / (1024 * 1024)
-        self.statusBar().showMessage(
+        message = (
             f"Library: {self.library_path} — {len(self.assets)} models, "
             f"{total_tris:,} / {QUEST_TRIANGLE_BUDGET:,} tris (Quest), "
             f"{total_mb:.1f} / 100 MB"
         )
+        if removed:
+            message += f" • {removed} removed (no longer on disk)"
+        self.statusBar().showMessage(message)
+
+    # --- Collections ---
 
     def refresh_collections(self) -> None:
         current = self.current_collection()
@@ -395,6 +472,8 @@ class MainWindow(QMainWindow):
         self.populate_cards()
         self.update_budget_bar()
 
+    # --- Cards, filters, sorting ---
+
     def visible_assets(self) -> list:
         query = self.search.text().strip().lower()
         fmt = self.format_combo.currentText()
@@ -447,6 +526,11 @@ class MainWindow(QMainWindow):
                 f"{asset.triangles if asset.triangles is not None else '?'} tris — "
                 f"Quest: {card['triangles_quest']}{dup}{warn}"
             )
+            # Cached thumbnail only — generating here would stall every
+            # keystroke in search; scan_library renders them once.
+            thumb = self.thumb_dir / f"{asset.sha256}.png"
+            if thumb.exists():
+                item.setIcon(QIcon(QPixmap(str(thumb))))
             item.setData(Qt.UserRole, asset)
             self.cards.addItem(item)
 
@@ -459,24 +543,70 @@ class MainWindow(QMainWindow):
         else:
             assets = self.assets
         tris = sum(a.triangles or 0 for a in assets)
-        size_mb = sum(a.size_bytes for a in assets) / (1024 * 1024)
         pct = min(100, int(tris / QUEST_TRIANGLE_BUDGET * 100)) if tris else 0
         self.budget_bar.setValue(pct)
         self.budget_bar.setStyleSheet(
             "QProgressBar::chunk { background: %s; }"
             % ("#f85149" if pct >= 100 else "#d29922" if pct >= 80 else "#2ea043")
         )
+        totals = texture_totals_for(assets)
+        tex_mb = totals["texture_bytes"] / (1024 * 1024)
         label = collection or "All models"
         self.budget_label.setText(
             f"{label}: {tris:,} / {QUEST_TRIANGLE_BUDGET:,} tris (Quest) • "
-            f"{size_mb:.1f} / 100 MB"
+            f"Models {fmt_bytes(sum(a.size_bytes for a in assets))} • "
+            f"Textures {tex_mb:.1f} / 100 MB "
+            f"{traffic_dot(texture_mb_light(tex_mb))}"
         )
+        if totals["heaviest"]:
+            heavy = " • ".join(
+                f"{h['name']} {fmt_bytes(h['texture_bytes'])}"
+                for h in totals["heaviest"][:3]
+            )
+            self.texture_label.setText(f"Heaviest textures: {heavy}")
+        else:
+            self.texture_label.setText("No textures found next to these models.")
+
+    # --- Detail panel ---
 
     def on_card_clicked(self, item) -> None:
         asset = item.data(Qt.UserRole)
         if asset is None:
             return
-        self.selected_asset = asset
+        self._select_assets([asset])
+
+    def on_selection_changed(self) -> None:
+        """Ctrl+click / Shift+click selection — combined totals for >1."""
+        assets = [
+            item.data(Qt.UserRole)
+            for item in self.cards.selectedItems()
+            if item.data(Qt.UserRole) is not None
+        ]
+        self._select_assets(assets)
+
+    def _select_assets(self, assets: list) -> None:
+        self.selected_assets = list(assets)
+        if not assets:
+            self.selected_asset = None
+            self.detail_title.setText("Select a model")
+            self.detail_body.setText(
+                "Click a card to see its VRChat budget, source and license.\n\n"
+                "Tip: Add folder, then Scan — your files are never moved."
+            )
+            self.preview_label.setText("No preview yet")
+            self.preview_label.setPixmap(QPixmap())
+            return
+        if len(assets) == 1:
+            self._show_single_asset(assets[0])
+            return
+        # Multi-select: combined totals. The notes form still edits
+        # the first (anchor) model, and the body says so plainly.
+        anchor = assets[0]
+        self.selected_asset = anchor
+        self._fill_meta_form(anchor)
+        self._show_combined(assets)
+
+    def _fill_meta_form(self, asset) -> None:
         m = self.meta.get(str(asset.path), {})
         self.tags_edit.setText(m.get("tags", ""))
         self.source_combo.setCurrentText(m.get("source", ""))
@@ -485,19 +615,71 @@ class MainWindow(QMainWindow):
         self.license_combo.setCurrentText(m.get("license", ""))
         self.collection_combo.setCurrentText(m.get("collection", ""))
         self.favorite_btn.setText("★ Favorite" if m.get("favorite") else "☆ Favorite")
+
+    def _show_single_asset(self, asset) -> None:
+        self.selected_asset = asset
+        self._fill_meta_form(asset)
         self.show_asset(
             asset.path.name,
-            AssetStats(triangles=asset.triangles, size_bytes=asset.size_bytes),
+            AssetStats(
+                triangles=asset.triangles,
+                materials=asset.materials,
+                max_texture_px=asset.max_texture_px,
+                scale_factor=asset.scale_factor,
+                size_bytes=asset.size_bytes,
+            ),
+            texture_count=asset.texture_count,
+            texture_bytes=asset.texture_bytes,
         )
+        self._show_preview(asset)
+        # Append scanner warnings (broken / unparsable files) to the body.
         if asset.warnings:
             self.detail_body.setText(
-                self.detail_body.text() + "\n\n⚠ " + "\n⚠ ".join(asset.warnings)
+                self.detail_body.text() + "<br/><br/>⚠ " + "<br/>⚠ ".join(asset.warnings)
             )
         if asset.sha256 in self.dup_shas:
             self.detail_body.setText(
                 self.detail_body.text()
-                + "\n\n⚠ Duplicate: another file in this library has the same content."
+                + "<br/><br/>⚠ Duplicate: another file in this library has the same content."
             )
+
+    def _show_combined(self, assets: list) -> None:
+        """Combined totals for a multi-select — the answer before export."""
+        totals = texture_totals_for(assets)
+        total_tris = totals["triangles"]
+        total_mb = sum(a.size_bytes for a in assets)
+        tex_mb = totals["texture_bytes"] / (1024 * 1024)
+        materials = sum(a.materials or 0 for a in assets)
+        unknown_mats = sum(1 for a in assets if a.materials is None)
+        tris_light = traffic_light(
+            total_tris, QUEST_TRIANGLE_BUDGET, QUEST_TRIANGLE_BUDGET
+        )
+        self.detail_title.setText(f"{len(assets)} models selected")
+        self.preview_label.setText(f"{len(assets)} models selected")
+        self.preview_label.setPixmap(QPixmap())
+        lines = [
+            f"{traffic_dot(tris_light)} Quest: {total_tris:,} / "
+            f"{QUEST_TRIANGLE_BUDGET:,} triangles combined",
+            f"{traffic_dot(texture_mb_light(tex_mb))} Textures: "
+            f"{tex_mb:.1f} / 100 MB",
+            f"Models: {fmt_bytes(total_mb)} on disk",
+            "Materials: "
+            f"{materials}"
+            + (f" (+{unknown_mats} unknown)" if unknown_mats else "")
+            + " (each one adds a draw call)",
+        ]
+        if totals["heaviest"]:
+            heavy = ", ".join(
+                f"{h['name']} {fmt_bytes(h['texture_bytes'])}"
+                for h in totals["heaviest"][:3]
+            )
+            lines.append(f"Heaviest textures: {heavy}")
+        lines.append("")
+        lines.append(
+            "Export to Unity exports all selected models. "
+            "Notes below apply to the first model."
+        )
+        self.detail_body.setText("<br/>".join(lines))
 
     def save_meta(self) -> None:
         if self.selected_asset is None:
@@ -535,38 +717,84 @@ class MainWindow(QMainWindow):
         self.populate_cards()
         self.update_budget_bar()
 
-    def show_asset(self, name: str, stats: AssetStats) -> None:
+    def _show_preview(self, asset) -> None:
+        """Big preview in the detail panel (generated once, cached)."""
+        thumb = thumbnail_for(asset.path, self.thumb_dir)
+        if thumb is not None:
+            pixmap = QPixmap(str(thumb))
+            self.preview_label.setPixmap(
+                pixmap.scaled(300, 300, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            )
+            return
+        if asset.path.suffix.lower() == ".blend":
+            from .blend import unavailable_reason
+
+            reason = unavailable_reason() or "Blender unavailable"
+            self.preview_label.setText(
+                f"No preview — {reason}.\nOpen in Blender to see it."
+            )
+        else:
+            self.preview_label.setText(
+                "No preview — this mesh could not be read.\n"
+                "Check the warnings below."
+            )
+
+    def show_asset(
+        self,
+        name: str,
+        stats: AssetStats,
+        texture_count: int = 0,
+        texture_bytes: int = 0,
+    ) -> None:
         """Fill the detail panel for one asset. Colour first, numbers second."""
         card = check_asset(stats)
+        materials = (
+            f"{stats.materials} materials" if stats.materials is not None else "? materials"
+        )
+        max_tex = (
+            f"{stats.max_texture_px} px" if stats.max_texture_px is not None else "? px"
+        )
+        textures = (
+            f"{texture_count} file(s), max {max_tex}, "
+            f"{fmt_bytes(texture_bytes)}"
+            if texture_count
+            else "none found next to the model"
+        )
+        scale_line = ""
+        if stats.scale_factor is not None:
+            note = (
+                " (Blender default — may import 100x small in Unity)"
+                if stats.scale_factor == 0.01
+                else ""
+            )
+            scale_line = f"FBX scale: {stats.scale_factor}{note}<br/>"
         self.detail_title.setText(name)
+        # NOTE: the traffic dots are HTML, so this label renders as
+        # rich text — line breaks must be <br/>, plain "\n" collapses.
         self.detail_body.setText(
             f"{traffic_dot(card['triangles_quest'])} Quest: "
-            f"{stats.triangles or '?'} triangles\n"
+            f"{stats.triangles or '?'} triangles<br/>"
             f"{traffic_dot(card['triangles_pc'])} PC: "
-            f"{stats.triangles or '?'} triangles\n"
-            f"Max texture: {stats.max_texture_px or '?'} px\n"
-            f"Size: {stats.size_bytes / 1024:.0f} KB\n\n"
-            + "\n".join(card["warnings"])
+            f"{stats.triangles or '?'} triangles<br/>"
+            f"{traffic_dot(card['texture'])} Max texture: {max_tex}<br/>"
+            f"Materials: {materials} (each one adds a draw call)<br/>"
+            f"Textures: {textures}<br/>"
+            f"{scale_line}"
+            f"Size: {fmt_bytes(stats.size_bytes)}<br/><br/>"
+            + "<br/>".join(card["warnings"])
         )
 
-    def _enrich_manifest(self, out_dir: Path, paths: list[Path]) -> None:
-        manifest_path = out_dir / "manifest.json"
-        if not manifest_path.exists():
-            return
-        data = json.loads(manifest_path.read_text(encoding="utf-8"))
-        for entry in data.get("assets", []):
-            for p in paths:
-                if p.name == entry.get("file"):
-                    m = self.meta.get(str(p), {})
-                    entry["source"] = m.get("source", "")
-                    entry["author"] = m.get("author", "")
-                    entry["url"] = m.get("url", "")
-                    entry["license"] = m.get("license", "")
-                    entry["tags"] = m.get("tags", "")
-        manifest_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    # --- Actions ---
+
+    def _meta_for(self, paths) -> dict:
+        return {str(p): self.meta.get(str(p), {}) for p in paths}
 
     def export_selected(self) -> None:
-        if self.selected_asset is None:
+        """Export the selected model(s) — one card or a multi-select."""
+        assets = self.selected_assets or (
+            [self.selected_asset] if self.selected_asset is not None else []
+        )
+        if not assets:
             self.detail_body.setText("Select a model card first, then Export to Unity.")
             return
         out = QFileDialog.getExistingDirectory(self, "Choose where to export for Unity")
@@ -574,13 +802,20 @@ class MainWindow(QMainWindow):
             return
         world = self.current_collection() or "World"
         out_dir = Path(out) / f"Export_{world}"
-        result = export_collection([self.selected_asset.path], out_dir, world)
-        self._enrich_manifest(out_dir, [self.selected_asset.path])
-        message = f"Exported to {result['out_dir']}"
+        result = export_collection(
+            [a.path for a in assets],
+            out_dir,
+            world,
+            meta_by_path=self._meta_for([a.path for a in assets]),
+        )
+        names = ", ".join(a.path.name for a in assets[:3])
+        if len(assets) > 3:
+            names += f" (+{len(assets) - 3} more)"
+        message = f"Exported {len(assets)} model(s) ({names}) to {result['out_dir']}"
         if result["warnings"]:
             message += "\n\n" + "\n".join(f"! {w}" for w in result["warnings"])
         self.detail_body.setText(message)
-        self.statusBar().showMessage(f"Exported {self.selected_asset.path.name} to {out}")
+        self.statusBar().showMessage(f"Exported {len(assets)} model(s) to {out}")
 
     def export_current_collection(self) -> None:
         assets = self.visible_assets()
@@ -592,9 +827,40 @@ class MainWindow(QMainWindow):
             return
         world = self.current_collection() or "World"
         out_dir = Path(out) / f"Export_{world}"
-        result = export_collection([a.path for a in assets], out_dir, world)
-        self._enrich_manifest(out_dir, [a.path for a in assets])
+        result = export_collection(
+            [a.path for a in assets],
+            out_dir,
+            world,
+            meta_by_path=self._meta_for([a.path for a in assets]),
+        )
         message = f"Exported {result['assets']} models to {result['out_dir']}"
+        if result["warnings"]:
+            message += "\n\n" + "\n".join(f"! {w}" for w in result["warnings"][:5])
+        self.detail_body.setText(message)
+        self.statusBar().showMessage(message.split("\n")[0])
+
+    def export_package(self) -> None:
+        """Selected models as one .unitypackage — or the current view."""
+        assets = self.selected_assets or self.visible_assets()
+        if not assets:
+            self.statusBar().showMessage("Nothing to export — the current view is empty.")
+            return
+        world = self.current_collection() or "World"
+        out, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save .unitypackage",
+            f"Export_{world}.unitypackage",
+            "Unity package (*.unitypackage)",
+        )
+        if not out:
+            return
+        result = export_unitypackage(
+            [a.path for a in assets],
+            Path(out),
+            world,
+            meta_by_path=self._meta_for([a.path for a in assets]),
+        )
+        message = f"Exported {result['assets']} models to {result['out_file']}"
         if result["warnings"]:
             message += "\n\n" + "\n".join(f"! {w}" for w in result["warnings"][:5])
         self.detail_body.setText(message)
@@ -604,7 +870,10 @@ class MainWindow(QMainWindow):
         if self.selected_asset is None:
             self.detail_body.setText("Select a model card first, then Open in Blender.")
             return
-        blender = shutil.which("blender")
+        from .blend import find_blender
+
+        found = find_blender()
+        blender = str(found) if found is not None else shutil.which("blender")
         if blender is None:
             self.detail_body.setText(
                 "Blender was not found in PATH.\n"
