@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vrchat-asset-vault"
-version = "0.3.0"
+version = "0.4.0"
 description = "Free, local-first 3D asset library for VRChat world creators"
 requires-python = ">=3.11"
 license = {text = "MIT"}
@@ -12,7 +12,8 @@ dependencies = []
 
 [project.optional-dependencies]
 gui = ["PySide6>=6.6"]
-mesh = ["trimesh>=4.0", "numpy>=1.26"]
+mesh = ["trimesh>=4.0", "numpy>=1.26", "fast-simplification>=0.2.0"]
+optimize = ["Pillow>=10.0"]
 
 [project.scripts]
 vrchat-asset-vault = "vrchat_asset_vault.__main__:main"

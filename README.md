@@ -25,6 +25,41 @@ fits your world's VRChat budget — then export a clean folder ready for Unity.
   compression on Android / Quest. This tool shows that per asset, for
   PC and Quest separately, before you build.
 
+## What's new in v0.4 (2026-11-26)
+
+- **One-click Quest optimizer.** Pick a world (or a selection) and a
+  preset — Gentle (keep 75% of triangles), Balanced (50%, the
+  default), Aggressive (25%), or Custom — and the Vault writes
+  Quest-ready copies to `Optimized_<World>/`, with a before/after
+  report (`optimization_report.json`), a `manifest.json`, and
+  `CREDITS.md`. It decimates meshes, downscales textures to the
+  preset limit, and fixes the FBX scale of old Blender exports
+  (the 0.01 factor) back to the model's authored size. **Your
+  originals are never modified** — the optimizer only ever reads
+  them; every output is verified (triangle count, texture size,
+  bounding box, silhouette) and a failed check falls back to an
+  untouched copy of the original.
+- **What it needs.** OBJ / GLB work with no Blender installed.
+  FBX and `.blend` need Blender on PATH (the GUI says so up front,
+  before you start — FBX without Blender is skipped, never silently
+  converted). Install the extras for the full engine:
+  `pip install -e .[gui,mesh,optimize]`.
+- **What it refuses.** Anything rigged — meshes with shape keys,
+  armatures or animations are skipped with a reason, never
+  decimated. Favourite (★) hero assets are never touched by
+  Aggressive and get a "check visually" flag on Balanced. No
+  texture atlasing, no LODs, no avatars in v1 — those stay out on
+  purpose (see `docs/MVP.md`).
+- **Quality is lossy by definition.** A 50% decimation is a measured
+  trade, not a free lunch: the report tells you the exact triangle
+  and texture numbers, and flags any model whose silhouette moved
+  enough to check visually before you use it.
+- **CLI:** `python -m vrchat_asset_vault optimize vault.db
+  --collection "Biblioteca Prohibida" --preset Balanced --out
+  "D:\Exports\Optimized_Biblioteca"` — same engine as the GUI, so
+  the two can never disagree. `--engine trimesh` forces the
+  no-Blender path; `--engine blender` forces Blender.
+
 ## What's new in v0.3 (2026-11-13)
 
 - **Texture-memory totals per collection.** The budget bar now shows
@@ -86,9 +121,11 @@ fits your world's VRChat budget — then export a clean folder ready for Unity.
 8. Open in Blender / show in Explorer / copy path — no reinventing Blender.
 
 Explicitly **not** in v1: syncing purchases with Booth/Gumroad
-(Hoard already does that, free), mesh decimation / texture atlasing
-(Blender, CATS and VRWorldToolkit already do that — v1 only *warns*),
-a full PBR 3D viewer, AI search, cloud, or a model store.
+(Hoard already does that, free), texture atlasing, LODs and avatars
+(the optimizer deliberately refuses rigged meshes), a full PBR 3D
+viewer, AI search, cloud, or a model store. Mesh decimation used to
+be on this list — it landed in v0.4 (above), as a measured,
+verified, copy-only optimization, not as a silent rewrite.
 
 ## Install (Windows)
 
@@ -105,7 +142,7 @@ python.org) and then opens the window. No commands needed.
 ```bat
 python -m venv .venv
 .venv\Scripts\activate
-pip install -e .[gui]
+pip install -e .[gui,mesh,optimize]
 python -m vrchat_asset_vault gui
 ```
 
@@ -118,6 +155,7 @@ release tag — see `vrchat-asset-vault.spec`.
 ```bat
 python -m vrchat_asset_vault scan "D:\VRChat Assets" --db vault.db
 python -m vrchat_asset_vault budget vault.db --world "Biblioteca Prohibida"
+python -m vrchat_asset_vault optimize vault.db --collection "Biblioteca Prohibida" --preset Balanced --out "D:\Exports\Optimized_Biblioteca"
 python -m vrchat_asset_vault export vault.db --collection "Biblioteca Prohibida" --out "D:\Exports\Biblioteca"
 ```
 
@@ -134,6 +172,7 @@ never disagree about a triangle count.
 ## Tech
 
 Python 3.11+, PySide6 (GUI, next), SQLite (local index), `trimesh`
-when available for triangle counts, Blender headless for `.blend`
-stats + thumbnails (when installed; graceful fallback when not).
-MIT license.
++ `fast-simplification` when available for triangle counts and
+decimation, Pillow for texture downscale, Blender headless for
+`.blend` stats + thumbnails and the FBX optimizer path (when
+installed; graceful fallback when not). MIT license.
