@@ -67,6 +67,13 @@ to use. That outranks extra features.
 `src/vrchat_asset_vault/gui.py` — PySide6, one `MainWindow`.
 It calls the same `scanner` / `budget` / `database` / `exporter`
 modules as the CLI, so the CLI and the GUI can never disagree about
-a triangle count. Thumbnails in v0.1 are placeholders; real
-thumbnails come from trimesh (FBX/OBJ/GLB) and Blender headless
-(.blend) in the next step.
+a triangle count. Thumbnails are rendered by `preview.py` (pure
+standard library: a small scanline rasterizer + PNG writer, 2x
+supersampled), cached by content hash under
+`~/.vrchat_asset_vault/thumbnails/`; `.blend` thumbnails come from
+`blend.py` (Blender headless exports the mesh, the same rasterizer
+draws it) when Blender is installed.
+
+v0.3 additions: Ctrl+click / Shift+click multi-select with combined
+totals in the detail panel; texture-memory totals + heaviest assets
+under the budget bar; FBX UnitScaleFactor shown in the detail panel.
