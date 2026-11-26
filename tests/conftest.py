@@ -50,6 +50,40 @@ def write_glb_box(path: Path, with_material: bool = False) -> None:
     mesh.export(path)
 
 
+def write_subdivided_sphere_obj(path: Path, subdivisions: int = 2) -> int:
+    """An icosphere OBJ with a known, large triangle count.
+
+    subdivisions=2 → 320 faces, the optimizer's standard decimation
+    fixture (well above the 100-triangle floor, symmetric enough that
+    a 50% decimation keeps the bounding box and the silhouette).
+    Returns the face count.
+    """
+    pytest.importorskip("trimesh", reason="test mesh fixtures need trimesh")
+    import trimesh
+
+    mesh = trimesh.creation.icosphere(subdivisions=subdivisions)
+    mesh.export(path)
+    return len(mesh.faces)
+
+
+def write_subdivided_sphere_glb(
+    path: Path, subdivisions: int = 2, with_material: bool = False
+) -> int:
+    """Same sphere as GLB, optionally with one PBR material."""
+    pytest.importorskip("trimesh", reason="test mesh fixtures need trimesh")
+    import trimesh
+
+    mesh = trimesh.creation.icosphere(subdivisions=subdivisions)
+    if with_material:
+        from trimesh.visual.material import PBRMaterial
+
+        mesh.visual.material = PBRMaterial(
+            name="sphere_mat", baseColorFactor=[0.2, 0.5, 0.8, 1.0]
+        )
+    mesh.export(path)
+    return len(mesh.faces)
+
+
 def write_fake_fbx(path: Path, version: int) -> None:
     """Minimal binary FBX header: 21-byte magic + 2 marker bytes + version.
 

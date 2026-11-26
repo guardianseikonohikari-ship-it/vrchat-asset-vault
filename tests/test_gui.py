@@ -191,3 +191,175 @@ def test_blend_card_shows_real_stats_and_preview(window, library):
     assert "64 px" in body
     pixmap = window.preview_label.pixmap()
     assert pixmap is not None and not pixmap.isNull()
+
+# ---------------------------------------------------------------- optimizer
+
+def _wait_for_worker(window, timeout: float = 60.0) -> None:
+    """Pump events until the optimize worker finishes (or time out)."""
+    import time
+
+    from PySide6.QtWidgets import QApplication
+
+    deadline = time.monotonic() + timeout
+    while window.optimize_worker is not None and window.optimize_worker.isRunning():
+        if time.monotonic() > deadline:
+            raise AssertionError("optimize worker did not finish in time")
+        QApplication.processEvents()
+        time.sleep(0.05)
+    QApplication.processEvents()
+
+
+def test_optimize_preflight_shows_summary(window):
+    window.optimize_preflight()
+    body = window.detail_body.text()
+    assert "Optimize 4 model(s)" in body  # cube, book, box.glb, broken.fbx
+    assert "Balanced" in body
+    assert "Blender:" in body  # found here (.tools Blender), or not found
+    assert "Originals are never modified" in body
+    assert not window.start_optimize_btn.isHidden()
+    assert window.optimize_btn.isHidden()
+    assert window.detail_title.text() == "Optimize for Quest — ready"
+
+
+def test_optimize_preflight_warns_without_blender(window, monkeypatch):
+    import vrchat_asset_vault.gui as gui_module
+
+    monkeypatch.setattr(gui_module, "blender_available", lambda: False)
+    window.optimize_preflight()
+    body = window.detail_body.text()
+    assert "Blender: not found" in body
+    assert "will be skipped (no Blender): broken.fbx" in body
+
+
+def test_optimize_run_reports_and_writes_folder(
+    window, library, tmp_path, monkeypatch
+):
+    import json
+
+    import vrchat_asset_vault.gui as gui_module
+    from vrchat_asset_vault.optimizer import OptimizeCancelled  # noqa: F401
+    from vrchat_asset_vault.scanner import sha256_of
+
+    from conftest import write_subdivided_sphere_obj
+
+    # A real decimation target in the library, then rescan.
+    sphere = library / "sphere.obj"
+    write_subdivided_sphere_obj(sphere, subdivisions=2)
+    window.scan_library()
+    assert window.cards.count() == 5
+    before_hash = sha256_of(sphere)
+
+    # Trimesh engine for a fast, deterministic GUI test (the Blender
+    # engine has its own tests in test_blend_optimize.py).
+    monkeypatch.setattr(
+        "vrchat_asset_vault.blend.blender_available", lambda: False
+    )
+    monkeypatch.setattr(
+        "vrchat_asset_vault.gui.QFileDialog.getExistingDirectory",
+        lambda *args, **kwargs: str(tmp_path),
+    )
+    window.optimize_preflight()
+    window.start_optimization()
+    _wait_for_worker(window)
+
+    assert window.report_table.rowCount() == 5
+    statuses = {
+        window.report_table.item(r, 0).text(): window.report_table.item(r, 3).text()
+        for r in range(window.report_table.rowCount())
+    }
+    assert statuses["sphere.obj"] == "optimized"
+    assert statuses["broken.fbx"] == "skipped"  # FBX needs Blender
+    assert "Optimization finished" in window.detail_body.text()
+    assert "Optimized 5 model(s)" in window.statusBar().currentMessage()
+
+    out_dir = tmp_path / "Optimized_World"
+    data = json.loads((out_dir / "optimization_report.json").read_text(encoding="utf-8"))
+    assert data["totals"]["assets"] == 5
+    assert data["totals"]["triangles_before"] == sum(
+        a["triangles_before"] or 0 for a in data["assets"]
+    )
+    assert (out_dir / "sphere.obj").is_file()
+    assert sha256_of(sphere) == before_hash  # original untouched
+
+
+def test_optimize_cancel_stops_between_assets(window, tmp_path, monkeypatch):
+    import time
+
+    import vrchat_asset_vault.gui as gui_module
+    from vrchat_asset_vault.optimizer import OptimizeCancelled
+
+    def slow_collection(paths, out_dir, world, preset, **kwargs):
+        """One asset, then wait until cancelled, then stop."""
+        from vrchat_asset_vault.optimizer import AssetReport
+
+        cancel = kwargs.get("cancel_event")
+        yield AssetReport(
+            source=paths[0],
+            output=out_dir / "cube.obj",
+            status="optimized",
+            engine="trimesh",
+            triangles_before=12,
+            triangles_after=12,
+            texture_bytes_before=0,
+            texture_bytes_after=0,
+        )
+        deadline = time.monotonic() + 10.0
+        while not (cancel is not None and cancel.is_set()):
+            if time.monotonic() > deadline:
+                return
+            time.sleep(0.05)
+        raise OptimizeCancelled()
+
+    monkeypatch.setattr(gui_module, "optimize_collection", slow_collection)
+    monkeypatch.setattr(
+        "vrchat_asset_vault.gui.QFileDialog.getExistingDirectory",
+        lambda *args, **kwargs: str(tmp_path),
+    )
+    window.optimize_preflight()
+    window.start_optimization()
+    # Wait for the first asset to land in the table, then cancel.
+    import time as _time
+
+    deadline = _time.monotonic() + 10.0
+    while window.report_table.rowCount() == 0:
+        if _time.monotonic() > deadline:
+            raise AssertionError("first asset never reported")
+        from PySide6.QtWidgets import QApplication
+
+        QApplication.processEvents()
+        _time.sleep(0.05)
+    window.cancel_optimization()
+    _wait_for_worker(window)
+    assert window.report_table.rowCount() == 1
+    assert "Cancelled" in window.detail_body.text()
+    assert "cancelled" in window.statusBar().currentMessage().lower()
+
+
+def test_export_optimized_to_unity_after_run(window, library, tmp_path, monkeypatch):
+    import json
+
+    import vrchat_asset_vault.gui as gui_module
+
+    from conftest import write_subdivided_sphere_obj
+
+    write_subdivided_sphere_obj(library / "sphere.obj", subdivisions=2)
+    window.scan_library()
+    monkeypatch.setattr(
+        "vrchat_asset_vault.blend.blender_available", lambda: False
+    )
+    dirs = iter([str(tmp_path), str(tmp_path)])
+    monkeypatch.setattr(
+        "vrchat_asset_vault.gui.QFileDialog.getExistingDirectory",
+        lambda *args, **kwargs: next(dirs),
+    )
+    window.optimize_preflight()
+    window.start_optimization()
+    _wait_for_worker(window)
+    assert window.last_optimized_dir == tmp_path / "Optimized_World"
+
+    window.export_optimized_to_unity()
+    export_dir = tmp_path / "Export_World"
+    assert (export_dir / "manifest.json").is_file()
+    manifest = json.loads((export_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["assets"], "exported manifest is empty"
+    assert "Exported" in window.statusBar().currentMessage()
