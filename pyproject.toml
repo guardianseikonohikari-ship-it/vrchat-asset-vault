@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vrchat-asset-vault"
-version = "0.1.0"
+version = "0.3.0"
 description = "Free, local-first 3D asset library for VRChat world creators"
 requires-python = ">=3.11"
 license = {text = "MIT"}
