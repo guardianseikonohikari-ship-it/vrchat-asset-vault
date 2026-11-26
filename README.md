@@ -25,6 +25,48 @@ fits your world's VRChat budget — then export a clean folder ready for Unity.
   compression on Android / Quest. This tool shows that per asset, for
   PC and Quest separately, before you build.
 
+## What's new in v0.3 (2026-11-13)
+
+- **Texture-memory totals per collection.** The budget bar now shows
+  how much of the 100 MB Quest limit your textures eat, with a green /
+  amber / red dot — and names the heaviest assets ("Heaviest textures:
+  shelf.fbx 8.1 MB"), so you know what to shrink first. Same totals
+  in `budget` on the CLI.
+- **FBX scale detection.** The scanner reads `UnitScaleFactor` from
+  the binary FBX and flags Blender's 0.01 default in the detail panel
+  and in export warnings, before the model imports 100x too small in
+  Unity.
+- **Multi-select.** Ctrl+click / Shift+click several cards: the detail
+  panel shows their combined triangles, texture memory and materials,
+  and Export / Export .unitypackage export exactly the selection.
+- **`.blend` stats + thumbnails via Blender headless.** When Blender
+  is installed, `.blend` files get real triangle/material/texture
+  stats and a rendered thumbnail (same 3/4 view as the other formats,
+  same cache). When Blender is missing, the card says so honestly
+  instead of guessing — install Blender and rescan.
+- **Caveat:** scanning a folder with many `.blend` files costs one
+  Blender start per file (~1-2 s each). Thumbnails are cached, so a
+  rescan only re-runs Blender for new or changed files.
+
+## What's new in v0.2 (2026-11-13)
+
+- **Real thumbnails.** Cards and the detail panel show a rendered
+  3/4 view of each model (pure-stdlib rasterizer, no new dependency),
+  cached by content hash. `.blend` had no preview yet — fixed in v0.3
+  (above).
+- **The VRChat card is complete now.** Materials are counted (OBJ
+  `usemtl`, FBX/GLB via trimesh) and texture sizes are read from the
+  file headers (PNG/JPEG/BMP/TGA, no Pillow) — the 1024px warning
+  actually fires now instead of showing "?".
+- **Stale files leave the library.** A rescan drops index rows whose
+  file no longer exists on disk, and says how many it removed.
+- **Export as `.unitypackage`.** One file Unity opens on
+  double-click, with a stable `.meta` GUID per file, plus
+  `CREDITS.md` in every export (folder or package).
+- **FBX version is really checked.** The exporter reads the version
+  from the binary header and warns below 7.1, instead of only
+  checking that the file is binary.
+
 ## MVP (v0.1)
 
 1. Index folders recursively without moving anything — SQLite index,
@@ -67,6 +109,10 @@ pip install -e .[gui]
 python -m vrchat_asset_vault gui
 ```
 
+No account, no subscription, no telemetry. The `.exe` is built by
+GitHub Actions (`.github/workflows/build-windows.yml`) on every
+release tag — see `vrchat-asset-vault.spec`.
+
 ## Use
 
 ```bat
@@ -88,5 +134,6 @@ never disagree about a triangle count.
 ## Tech
 
 Python 3.11+, PySide6 (GUI, next), SQLite (local index), `trimesh`
-when available for triangle counts, Blender headless only for
-`.blend` thumbnails. MIT license.
+when available for triangle counts, Blender headless for `.blend`
+stats + thumbnails (when installed; graceful fallback when not).
+MIT license.
